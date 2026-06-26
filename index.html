@@ -50,6 +50,7 @@ const C = {
   ok:"#5DBE8A", ng:"#FF6B6B", border:"#EAD8C0", yellow:"#FFE066",
 };
 
+// ── date helpers ──
 // ── 音声読み上げ ──
 // 「Kyoko（拡張）」をダウンロード済みなら最優先で使う。
 // iOSで高品質版をダウンロードすると名前に「(拡張)」「(Enhanced)」等が付くことが多いため、
@@ -63,11 +64,7 @@ const FALLBACK_VOICE_NAMES = ["Google 日本語", "Hattori", "O-Ren", "Otoya"];
 function getJaVoices() {
   if (!window.speechSynthesis) return [];
   const voices = window.speechSynthesis.getVoices();
-  // 【修正】v.lang が undefined / 空文字の環境があり、startsWith でTypeErrorになるのを防ぐ
-  return voices.filter(v => {
-    const lang = v.lang || "";
-    return lang === "ja-JP" || lang === "ja_JP" || lang.startsWith("ja");
-  });
+  return voices.filter(v => v.lang === "ja-JP" || v.lang === "ja_JP" || v.lang.startsWith("ja"));
 }
 
 function pickBestVoice() {
@@ -75,14 +72,14 @@ function pickBestVoice() {
   if (jaVoices.length === 0) return null;
   // ① Kyoko（拡張）を最優先
   for (const pattern of PREFERRED_VOICE_PATTERNS) {
-    const found = jaVoices.find(v => (v.name || "").includes(pattern));
+    const found = jaVoices.find(v => v.name.includes(pattern));
     if (found) return found;
   }
   // ② ローカル合成（ネットワーク不要）を優先
   const localVoices = jaVoices.filter(v => v.localService);
   const pool = localVoices.length > 0 ? localVoices : jaVoices;
   for (const name of FALLBACK_VOICE_NAMES) {
-    const found = pool.find(v => (v.name || "").includes(name));
+    const found = pool.find(v => v.name.includes(name));
     if (found) return found;
   }
   return pool[0];
@@ -95,39 +92,13 @@ let speakDebounceTimer = null;
 const SPEAK_DEBOUNCE_MS = 120;
 const CANCEL_SPEAK_GAP_MS = 50;
 
-// 【修正】発話シーケンスIDによる確実な前回キャンセル機構
-// 過去の speakPhrases / speakText の onend / setTimeout が遅延発火しても、
-// 自分のシーケンスIDが現行と一致しなければ無視されるため、混線を完全に防げる。
-let currentSpeechSequenceId = 0;
-// 進行中シーケンスが内部で生成したタイマーIDの集合（新規発話開始時に全部clear）
-let activeSpeechTimers = new Set();
-
-function clearAllSpeechTimers() {
-  if (speakDebounceTimer) {
-    clearTimeout(speakDebounceTimer);
-    speakDebounceTimer = null;
-  }
-  for (const id of activeSpeechTimers) clearTimeout(id);
-  activeSpeechTimers.clear();
-}
-
-function startNewSpeechSequence() {
-  // 過去シーケンスを論理的に無効化（コールバックが発火しても効かなくなる）
-  currentSpeechSequenceId++;
-  clearAllSpeechTimers();
-  return currentSpeechSequenceId;
-}
-
 function speakText(text, rate = 0.6) {
-  const mySeqId = startNewSpeechSequence();
-  const isCancelled = () => mySeqId !== currentSpeechSequenceId;
+  if (speakDebounceTimer) clearTimeout(speakDebounceTimer);
   speakDebounceTimer = setTimeout(() => {
-    if (isCancelled()) return;
     try {
       if (!window.speechSynthesis) return;
       window.speechSynthesis.cancel();
-      const t = setTimeout(() => {
-        if (isCancelled()) return;
+      setTimeout(() => {
         try {
           const utter = new SpeechSynthesisUtterance(text);
           utter.lang = "ja-JP";
@@ -139,12 +110,10 @@ function speakText(text, rate = 0.6) {
           window.speechSynthesis.speak(utter);
         } catch {}
       }, CANCEL_SPEAK_GAP_MS);
-      activeSpeechTimers.add(t);
     } catch {
       // 音声合成が使えない環境では何もしない
     }
   }, SPEAK_DEBOUNCE_MS);
-  activeSpeechTimers.add(speakDebounceTimer);
 }
 
 // 複数フレーズを「間（ポーズ）」をはっきり空けて順番に読む。
@@ -154,18 +123,20 @@ function speakText(text, rate = 0.6) {
 // 【既知の問題】iOS Safariではcancel()直後にspeak()すると、ごく稀にonendが発火しない
 // ことがある（WebKitの既知の不具合）。そのまま待ち続けると無音で止まってしまうため、
 // 推定発話時間＋余裕分のタイマーをフォールバックとして必ず仕込んでおく。
-// 【混線防止（修正済み）】シーケンスIDを使い、新しい speakText / speakPhrases が呼ばれた
-// 時点で過去の onend / タイマー callback を完全に無効化する。
+// 【混線防止】進行中の各タイマーIDをすべてspeakDebounceTimerに格納し直す。これにより、
+// フレーズ読み上げの途中で別の speakText / speakPhrases が呼ばれた場合、最初に行う
+// clearTimeout(speakDebounceTimer) で確実にこの進行中シーケンスも止められる
+// （シーケンスが混線して読み上げが入り乱れるのを防ぐ）。
 function speakPhrases(phrases, rate = 0.6, pauseMs = 550) {
-  const mySeqId = startNewSpeechSequence();
-  const isCancelled = () => mySeqId !== currentSpeechSequenceId;
+  if (speakDebounceTimer) clearTimeout(speakDebounceTimer);
+  let cancelled = false;
   try {
     if (!window.speechSynthesis || !phrases || phrases.length === 0) return;
     window.speechSynthesis.cancel();
     const voice = pickBestVoice();
     let i = 0;
     function speakNext() {
-      if (isCancelled() || i >= phrases.length) return;
+      if (cancelled || i >= phrases.length) return;
       const phrase = phrases[i];
       const utter = new SpeechSynthesisUtterance(phrase);
       utter.lang = "ja-JP";
@@ -177,28 +148,25 @@ function speakPhrases(phrases, rate = 0.6, pauseMs = 550) {
 
       let advanced = false;
       function advance() {
-        if (advanced || isCancelled()) return; // onendとタイマーの二重発火を防止
+        if (advanced || cancelled) return; // onendとタイマーの二重発火を防止
         advanced = true;
         if (i < phrases.length) {
-          const t = setTimeout(speakNext, pauseMs);
-          activeSpeechTimers.add(t);
+          speakDebounceTimer = setTimeout(speakNext, pauseMs);
         }
       }
 
       utter.onend = advance;
       utter.onerror = advance; // エラー時も止まらず次に進む
 
-      try { window.speechSynthesis.speak(utter); } catch {}
+      window.speechSynthesis.speak(utter);
 
       // フォールバック：文字数から推定した発話時間＋十分なマージンで強制的に次へ進める
       // （日本語はおよそ1文字=200ms程度を目安に、rateで補正）
       const estimatedMs = (phrase.length * 220) / rate + 1200;
-      const fallback = setTimeout(advance, estimatedMs);
-      activeSpeechTimers.add(fallback);
+      speakDebounceTimer = setTimeout(advance, estimatedMs);
     }
     // cancel()の直後すぐにspeak()しないよう、ごく短い遅延を挟む
     speakDebounceTimer = setTimeout(speakNext, CANCEL_SPEAK_GAP_MS);
-    activeSpeechTimers.add(speakDebounceTimer);
   } catch {
     // 音声合成が使えない環境では何もしない
   }
@@ -253,7 +221,6 @@ function getAudioCtx() {
   try {
     if (!audioCtx) {
       const AC = window.AudioContext || window.webkitAudioContext;
-      if (!AC) return null;
       audioCtx = new AC();
     }
     return audioCtx;
@@ -265,20 +232,18 @@ function playTone(freq, duration, delay = 0, type = "sine", gainPeak = 0.25) {
   if (!ctx) return;
   // iOS/Safariではコンテキストがsuspendedのままになることがあるため、毎回resumeしてから鳴らす
   const playNow = () => {
-    try {
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = type;
-      osc.frequency.value = freq;
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-      const startTime = ctx.currentTime + delay;
-      gain.gain.setValueAtTime(0, startTime);
-      gain.gain.linearRampToValueAtTime(gainPeak, startTime + 0.02);
-      gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
-      osc.start(startTime);
-      osc.stop(startTime + duration + 0.02);
-    } catch {}
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = type;
+    osc.frequency.value = freq;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    const startTime = ctx.currentTime + delay;
+    gain.gain.setValueAtTime(0, startTime);
+    gain.gain.linearRampToValueAtTime(gainPeak, startTime + 0.02);
+    gain.gain.exponentialRampToValueAtTime(0.001, startTime + duration);
+    osc.start(startTime);
+    osc.stop(startTime + duration + 0.02);
   };
   if (ctx.state === "suspended") {
     ctx.resume().then(playNow).catch(() => {});
@@ -303,6 +268,7 @@ function playWrongSound() {
   } catch {}
 }
 
+// バイブレーション（対応端末のみ。iOSのSafariは未対応のことが多い）
 // バイブレーション（Android Chrome等）+ iOS用ハプティック代替
 function vibrate(pattern) {
   try {
@@ -329,10 +295,7 @@ function triggerIOSHaptic() {
     input.style.height = "1px";
     document.body.appendChild(input);
     input.click();
-    // 【修正】removeChildではなくelement.remove()＋try/catchで安全に削除
-    setTimeout(() => {
-      try { input.remove(); } catch {}
-    }, 50);
+    setTimeout(() => document.body.removeChild(input), 50);
   } catch {}
 }
 
@@ -404,6 +367,7 @@ function makeQs(pair) {
 }
 
 // ── status ──
+// ── status ──
 // "new"           未着手
 // "retry"         不合格・翌日以降
 // "done_today"    今日、未合格のままチャレンジした（新規/リトライ） ※新規ブロック判定に使う
@@ -452,14 +416,11 @@ function statusEmoji(s) {
 // skipIds: 今日すでにやったstepId（タスクから除外）
 // blockNew: true のとき新規/リトライを一切出さない（もう1セットは手動選択に任せる）
 // 戻り値: { tasks: [...], extraOverdue: N } — 配列にプロパティを生やさず素直なオブジェクトで返す
-//
-// 【修正】doneToday判定で skipIds を見ない。skipIdsに入っているステップは getStatus 上では
-// done_today / passed_today のままなので、skipIdsで除外してから doneToday を判定すると
-// 「今日新規をやったのに doneToday=false になり、もう一つ新規が出てしまう」バグが発生する。
 function getTodayTasks(steps, today, skipIds = new Set(), blockNew = false) {
   const tasks = [];
-  // skipIdsに関係なく、今日「新規/リトライにチャレンジしたかどうか」を判定
+  // 今日「新規/リトライにチャレンジした」かどうか（不合格でも合格でも、新規枠は今日1回まで）
   const doneToday = STEPS.some(s => {
+    if (skipIds.has(s.id)) return false;
     const st = getStatus(s.id, steps, today);
     return st === "done_today" || st === "passed_today";
   });
@@ -525,15 +486,12 @@ function TraceWriting({ ch, color, onComplete }) {
   const offscreenRef = useRef(null);   // 文字の輪郭判定用（非表示）
   const charPixelsRef = useRef(null);  // 文字がある座標の一覧（スナップ候補）
   const containerRef = useRef(null);
-  // 【修正】isDrawingをuseRefにも持たせる。setStateは非同期で反映されるため、
-  // startDraw直後の最初の数イベントでdrawが「描画しない」状態を防ぐ。
-  const isDrawingRef = useRef(false);
   const [traced, setTraced] = useState(0);
-  const tracedRef = useRef(0); // 同じ理由：tracedも参照系で常時最新を読めるように
+  const [isDrawing, setIsDrawing] = useState(false);
   const [canvasSize, setCanvasSize] = useState(300);
   const lastPoint = useRef(null);
   const TRACE_GOAL = 600; // 累積移動距離(px)で完了判定。指を小さく揺らすだけでは完了しないようにする
-  const SNAP_RADIUS = 65; // この距離以内の文字ピクセルになら吸着させる
+  const SNAP_RADIUS = 65; // この距離以内の文字ピクセルになら吸着させる（強化：40→65）
 
   // 画面幅に合わせてキャンバスサイズを決定（画面いっぱい・正方形）
   useEffect(() => {
@@ -562,20 +520,16 @@ function TraceWriting({ ch, color, onComplete }) {
     offscreenRef.current = off;
 
     // ピクセルを間引きながらサンプリングして「文字がある点」リストを作る（毎回全ピクセル走査は重いため）
-    try {
-      const imgData = octx.getImageData(0, 0, canvasSize, canvasSize).data;
-      const pts = [];
-      const STEP_PX = 3; // 3pxおきにサンプリング
-      for (let y = 0; y < canvasSize; y += STEP_PX) {
-        for (let x = 0; x < canvasSize; x += STEP_PX) {
-          const alpha = imgData[(y * canvasSize + x) * 4 + 3];
-          if (alpha > 80) pts.push({ x, y });
-        }
+    const imgData = octx.getImageData(0, 0, canvasSize, canvasSize).data;
+    const pts = [];
+    const STEP_PX = 3; // 3pxおきにサンプリング
+    for (let y = 0; y < canvasSize; y += STEP_PX) {
+      for (let x = 0; x < canvasSize; x += STEP_PX) {
+        const alpha = imgData[(y * canvasSize + x) * 4 + 3];
+        if (alpha > 80) pts.push({ x, y });
       }
-      charPixelsRef.current = pts;
-    } catch {
-      charPixelsRef.current = [];
     }
+    charPixelsRef.current = pts;
   }, [ch, canvasSize]);
 
   // ユーザーの座標を「最も近い文字上の点」に補正する
@@ -593,8 +547,10 @@ function TraceWriting({ ch, color, onComplete }) {
     if (best && bestDist <= SNAP_RADIUS * SNAP_RADIUS) {
       // 距離が近いほど強く文字側に寄せる可変ブレンド。
       // 中心付近（距離0）ではほぼ完全に文字の上に乗せ、範囲の外周に近いほど指の位置を残す。
+      // これにより「だいたい合っていれば、ちゃんとした線になる」体験を強化する。
       const dist = Math.sqrt(bestDist);
       const t = dist / SNAP_RADIUS; // 0(文字のすぐ上)～1(範囲ぎりぎり)
+      // 文字側への寄せ比率：最低でも80%、近いほど最大97%まで強くする
       const snapStrength = 0.97 - t * 0.17;
       return {
         x: pos.x * (1 - snapStrength) + best.x * snapStrength,
@@ -613,49 +569,28 @@ function TraceWriting({ ch, color, onComplete }) {
     };
   }
 
-  // 共通：点を1つ打つ（startDrawで「ちょん」と置いた瞬間にも描画されるように）
-  function drawDot(ctx, pos, size) {
-    ctx.fillStyle = color;
-    ctx.globalAlpha = 0.85;
-    ctx.beginPath();
-    ctx.arc(pos.x, pos.y, size / 2, 0, Math.PI * 2);
-    ctx.fill();
-  }
-
   function startDraw(e) {
     e.preventDefault();
-    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch {}
-    isDrawingRef.current = true; // 【修正】refで即座に反映
+    e.currentTarget.setPointerCapture?.(e.pointerId); // 領域外に出ても確実にイベントを追跡
+    setIsDrawing(true);
     const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
     const rawPos = getPos(e, canvas);
-    const pos = snapToChar(rawPos);
-    lastPoint.current = pos;
-
-    // 【修正】点を打って描画＋距離を少し加算（ちょんと置いただけでも反応する）
-    const lineWidth = Math.max(14, canvasSize * 0.045);
-    drawDot(ctx, pos, lineWidth);
-    const addedDist = lineWidth * 0.5;
-    tracedRef.current = Math.min(tracedRef.current + addedDist, TRACE_GOAL);
-    setTraced(tracedRef.current);
+    lastPoint.current = snapToChar(rawPos);
   }
 
   function draw(e) {
-    if (!isDrawingRef.current) return; // 【修正】refで即座に判定
+    if (!isDrawing) return;
     e.preventDefault();
     const canvas = canvasRef.current;
-    if (!canvas) return;
     const ctx = canvas.getContext("2d");
     const rawPos = getPos(e, canvas);
-    const pos = snapToChar(rawPos);
+    const pos = snapToChar(rawPos); // ← 補正後の座標で描画する
     if (lastPoint.current) {
       const dx = pos.x - lastPoint.current.x;
       const dy = pos.y - lastPoint.current.y;
       const dist = Math.sqrt(dx * dx + dy * dy);
-      const lineWidth = Math.max(14, canvasSize * 0.045);
       ctx.strokeStyle = color;
-      ctx.lineWidth = lineWidth;
+      ctx.lineWidth = Math.max(14, canvasSize * 0.045);
       ctx.lineCap = "round";
       ctx.lineJoin = "round";
       ctx.globalAlpha = 0.85;
@@ -663,15 +598,14 @@ function TraceWriting({ ch, color, onComplete }) {
       ctx.moveTo(lastPoint.current.x, lastPoint.current.y);
       ctx.lineTo(pos.x, pos.y);
       ctx.stroke();
-      tracedRef.current = Math.min(tracedRef.current + dist, TRACE_GOAL);
-      setTraced(tracedRef.current);
+      setTraced(t => Math.min(t + dist, TRACE_GOAL));
     }
     lastPoint.current = pos;
   }
 
   function endDraw(e) {
-    if (e && e.preventDefault) e.preventDefault();
-    isDrawingRef.current = false;
+    e.preventDefault();
+    setIsDrawing(false);
     lastPoint.current = null;
   }
 
@@ -680,7 +614,6 @@ function TraceWriting({ ch, color, onComplete }) {
     if (!canvas) return;
     const ctx = canvas.getContext("2d");
     ctx.clearRect(0, 0, canvas.width, canvas.height);
-    tracedRef.current = 0;
     setTraced(0);
   }
 
@@ -842,9 +775,6 @@ function DragQuestion({ pair, q, colA, colB, onAnswer }) {
   const containerRef = useRef(null);
   const dropZoneRef = useRef(null);
   const cardStartPos = useRef({ x: 0, y: 0 }); // ドラッグ開始時のポインタ位置
-  // 【修正】phaseもrefで持つ。pointerMove/Upはstate反映前に呼ばれることがあるため
-  const phaseRef = useRef("idle");
-  const draggingPairIdxRef = useRef(null);
 
   const colors = [colA, colB];
 
@@ -856,20 +786,18 @@ function DragQuestion({ pair, q, colA, colB, onAnswer }) {
   }
 
   function handlePointerDown(pairIdx, e) {
-    if (phaseRef.current !== "idle") return;
+    if (phase !== "idle") return;
     e.preventDefault();
-    try { e.currentTarget.setPointerCapture?.(e.pointerId); } catch {}
+    e.currentTarget.setPointerCapture?.(e.pointerId);
     cardStartPos.current = { x: e.clientX, y: e.clientY };
     setDragPos({ x: 0, y: 0 });
-    phaseRef.current = "dragging";
-    draggingPairIdxRef.current = pairIdx;
     setPhase("dragging");
     setDraggingPairIdx(pairIdx);
     setOverDrop(false);
   }
 
   function handlePointerMove(e) {
-    if (phaseRef.current !== "dragging") return;
+    if (phase !== "dragging") return;
     e.preventDefault();
     const dx = e.clientX - cardStartPos.current.x;
     const dy = e.clientY - cardStartPos.current.y;
@@ -878,21 +806,17 @@ function DragQuestion({ pair, q, colA, colB, onAnswer }) {
   }
 
   function handlePointerUp(e) {
-    if (phaseRef.current !== "dragging") return;
+    if (phase !== "dragging") return;
     e.preventDefault();
-    const draggedIdx = draggingPairIdxRef.current;
     if (isOverDropZone(e.clientX, e.clientY)) {
-      const correct = draggedIdx === q.ansIdx;
-      phaseRef.current = "dropped";
+      const correct = draggingPairIdx === q.ansIdx;
       setPhase("dropped");
-      setDroppedPairIdx(draggedIdx);
+      setDroppedPairIdx(draggingPairIdx);
       setOverDrop(false);
       setResult(correct ? "correct" : "wrong");
       onAnswer(correct);
     } else {
       // 枠に入らなかった場合はカードを元の位置に戻す
-      phaseRef.current = "idle";
-      draggingPairIdxRef.current = null;
       setPhase("idle");
       setDraggingPairIdx(null);
       setOverDrop(false);
@@ -1023,7 +947,7 @@ export default function App() {
     }
     return () => {
       // クリーンアップ：このコンポーネントが追加したタグだけ削除（既存のものは残す）
-      addedTags.forEach(tag => { try { tag.remove(); } catch {} });
+      addedTags.forEach(tag => tag.remove());
     };
   }, []);
 
@@ -1086,7 +1010,7 @@ export default function App() {
     // iOSではAudioContext生成直後の state チェックがすり抜けることがあるため、
     // 状態を確認せず常にresumeを試みる（すでにrunningなら何も起きないので安全）
     const ctx = getAudioCtx();
-    if (ctx) { try { ctx.resume().catch(() => {}); } catch {} }
+    if (ctx) ctx.resume().catch(() => {});
 
     setActiveStep(step);
     setQuizMode(mode);
@@ -1179,6 +1103,12 @@ export default function App() {
     });
     setSkipIds(prev => new Set([...prev, activeStep.id]));
     setExtraUnlocked(false); // 1セット終わるたびブロックに戻す
+  }
+
+  // 保存＋ホームへ遷移（通常のフロー終了時に呼ぶ）
+  function finish() {
+    persistResult();
+    setScreen("home");
   }
 
   // 今日すでに新規/リトライをやったか（不合格でチャレンジ済み done_today、または今日合格 passed_today の両方）
