@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="mobile-web-app-capable" content="yes" />
+<title>ひらがな学習</title>
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<style>
+  html, body { margin:0; padding:0; background:#FFFBF2; }
+  #root { min-height:100vh; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="env,react">
+/* {% raw %} */
+const { useState, useEffect, useRef } = React;
+
+// ── STEPS ──
+// words: [pair[0]の単語, pair[1]の単語] — 表示用
+// introPhrase: 読み上げを区切るフレーズの配列（を・んなど語頭に来ない文字用）
+//   例: ["りんごを たべる", "を"] → 「りんごを たべる」と読んだあと間を置いて「を」
+const STEPS = [
+  { id: 1,  pair: ["め", "ぬ"], kana: ["メ", "ヌ"], words: ["めがね", "ぬいぐるみ"] },
+  { id: 2,  pair: ["あ", "や"], kana: ["ア", "ヤ"], words: ["あめ", "やま"] },
+  { id: 3,  pair: ["い", "り"], kana: ["イ", "リ"], words: ["いぬ", "りんご"] },
+  { id: 4,  pair: ["の", "に"], kana: ["ノ", "ニ"], words: ["のはら", "にじ"] },
+  { id: 5,  pair: ["は", "を"], kana: ["ハ", "ヲ"], words: ["はさみ", "りんごを"],
+    introPhrase: [["はさみ", "は"], ["りんごを たべる", "を"]] },
+  { id: 6,  pair: ["か", "な"], kana: ["カ", "ナ"], words: ["かさ", "なつ"] },
+  { id: 7,  pair: ["て", "と"], kana: ["テ", "ト"], words: ["てがみ", "とけい"] },
+  { id: 8,  pair: ["し", "す"], kana: ["シ", "ス"], words: ["しお", "すいか"] },
+  { id: 9,  pair: ["き", "く"], kana: ["キ", "ク"], words: ["きいろ", "くるま"] },
+  { id: 10, pair: ["お", "こ"], kana: ["オ", "コ"], words: ["おかし", "こおり"] },
+  { id: 11, pair: ["さ", "た"], kana: ["サ", "タ"], words: ["さかな", "たまご"] },
+  { id: 12, pair: ["ま", "も"], kana: ["マ", "モ"], words: ["まど", "もも"] },
+  { id: 13, pair: ["う", "え"], kana: ["ウ", "エ"], words: ["うさぎ", "えんぴつ"] },
+  { id: 14, pair: ["ふ", "ひ"], kana: ["フ", "ヒ"], words: ["ふうせん", "ひこうき"] },
+  { id: 15, pair: ["ほ", "へ"], kana: ["ホ", "ヘ"], words: ["ほし", "へや"] },
+  { id: 16, pair: ["れ", "わ"], kana: ["レ", "ワ"], words: ["れもん", "わに"] },
+  { id: 17, pair: ["よ", "ろ"], kana: ["ヨ", "ロ"], words: ["よる", "ろうそく"] },
+  { id: 18, pair: ["つ", "る"], kana: ["ツ", "ル"], words: ["つき", "るすばん"] },
+  { id: 19, pair: ["み", "ゆ"], kana: ["ミ", "ユ"], words: ["みかん", "ゆき"] },
+  { id: 20, pair: ["け", "せ"], kana: ["ケ", "セ"], words: ["けむし", "せみ"] },
+  { id: 21, pair: ["そ", "ら"], kana: ["ソ", "ラ"], words: ["そら", "らくだ"] },
+  { id: 22, pair: ["む", "ね"], kana: ["ム", "ネ"], words: ["むし", "ねこ"] },
+  { id: 23, pair: ["ち", "ん"], kana: ["チ", "ン"], words: ["ちず", "ぱん"],
+    introPhrase: [null, ["ぱん", "ん"]] },
+];
+
+const REVIEW_DAYS = [1, 3, 7, 14, 30];
+const QUIZ_TOTAL = 8;       // 1回のクイズの問題数
+const PASS_THRESHOLD = 6;   // この数以上正解で合格
+const STEP_COLORS = [
+  "#FFE066","#FFB3C6","#A8D8EA","#B5EAD7","#FFDAC1",
+  "#FFE066","#FFB3C6","#A8D8EA","#B5EAD7","#FFDAC1",
+  "#FFE066","#FFB3C6","#A8D8EA","#B5EAD7","#FFDAC1",
+  "#FFE066","#FFB3C6","#A8D8EA","#B5EAD7","#FFDAC1",
+  "#FFE066","#FFB3C6","#A8D8EA",
+];
+const C = {
+  bg:"#FFFBF2", text:"#3D2C2C", muted:"#9E8A8A",
+  ok:"#5DBE8A", ng:"#FF6B6B", border:"#EAD8C0", yellow:"#FFE066",
+};
+
+// ── date helpers ──
+// ── 音声読み上げ ──
+// 「Kyoko（拡張）」をダウンロード済みなら最優先で使う。
+// iOSで高品質版をダウンロードすると名前に「(拡張)」「(Enhanced)」等が付くことが多いため、
+// 複数パターンで部分一致を試す。
+const PREFERRED_VOICE_PATTERNS = [
+  "Kyoko (拡張)", "Kyoko（拡張）", "Kyoko (Enhanced)", "Kyoko-premium", "Kyoko",
+];
+// それでも見つからない場合のフォールバック優先順
+const FALLBACK_VOICE_NAMES = ["Google 日本語", "Hattori", "O-Ren", "Otoya"];
+
+function getJaVoices() {
+  if (!window.speechSynthesis) return [];
+  const voices = window.speechSynthesis.getVoices();
+  return voices.filter(v => v.lang === "ja-JP" || v.lang === "ja_JP" || v.lang.startsWith("ja"));
+}
+
+function pick
